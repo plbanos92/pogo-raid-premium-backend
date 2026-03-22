@@ -74,6 +74,23 @@ supabase projects api-keys --project-ref <project-ref>
 
 Or use the Supabase Dashboard → Project Settings → API → Project API Keys.
 
+### 3. Local smoke-test secrets file (Windows helper)
+
+For `supabase/snippets/api_smoke_test.ps1`, use:
+- `supabase/snippets/.env.smoke.local`
+
+Example keys in that file:
+```
+SUPABASE_SERVICE_ROLE_KEY=<service-role-key>
+SMOKE_TEST_EMAIL=<confirmed-test-email>
+SMOKE_TEST_PASSWORD=<test-password>
+```
+
+Security notes:
+- This file is local-only and is gitignored.
+- The smoke script loads these into process env vars and restores/clears them after run.
+- Never place service role keys in frontend environment variables.
+
 ---
 
 ## Using environment variables in app code

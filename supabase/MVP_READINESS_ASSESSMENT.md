@@ -2,11 +2,17 @@
 
 ## Scope Reviewed
 - Folder reviewed: supabase/
-- Present: schema migrations, hardening migration, transactional RPC migration, local config, seed, SQL smoke tests, and CI workflow.
+- Present: schema migrations, hardening migration, transactional RPC migration, public read grant migration, local config, seed, SQL smoke tests, and CI workflow.
 
 ## Verdict
 - MVP trial readiness: Yes.
-- Production-grade MVP readiness: Nearly there, but still missing a few operational controls.
+- Production-grade MVP readiness: Yes for MVP scope, with follow-up operational hardening recommended.
+
+## Validation Snapshot
+- Migrations were pushed to remote and are in sync.
+- Seed data was pushed to remote.
+- Live smoke flow succeeded for auth bootstrap + queue RPC (`join_raid_queue`).
+- Public reference reads were fixed with explicit grant on `raid_bosses`.
 
 ## What Is Already Good
 - Core domain model is in place (profiles, raids, queues, subscriptions, confirmations, activity logs).
@@ -48,6 +54,12 @@ Impact:
 ## MVP Deployment Decision
 - If the goal is to start using APIs now for CRUD and queue/host core flows, this backend is complete enough for MVP deployment.
 - If the goal is production hardening for scale/compliance, complete the remaining controls above next.
+
+## Migrations Included In MVP Baseline
+1. `20260311094251_create_initial_schema.sql`
+2. `20260322121000_hardening_constraints_rls_indexes.sql`
+3. `20260322133000_add_queue_rpc.sql`
+4. `20260322150000_grant_public_read_raid_bosses.sql`
 
 ## Recommended Next Steps (Post-Deploy)
 1. Add a security/operations runbook and policy matrix document.

@@ -13,6 +13,30 @@ https://jkzbruimweyolcgjmram.supabase.co
 
 Set these as env variables (see `.env.example`). The examples below use `$SUPABASE_URL` and `$SUPABASE_ANON_KEY`.
 
+For end-to-end validation on Windows, use:
+- `supabase/snippets/api_smoke_test.ps1`
+- local secrets file: `supabase/snippets/.env.smoke.local` (gitignored)
+
+---
+
+## 0) Automated smoke test (recommended before manual calls)
+
+1. Fill `supabase/snippets/.env.smoke.local`:
+  - `SUPABASE_SERVICE_ROLE_KEY`
+  - `SMOKE_TEST_EMAIL`
+  - `SMOKE_TEST_PASSWORD`
+2. Run:
+```powershell
+.\supabase\snippets\api_smoke_test.ps1
+```
+
+What it covers:
+- auth flow (sign-in, optional admin bootstrap, signup fallback)
+- read raid bosses
+- create/read profile
+- list active raids
+- call `join_raid_queue`
+
 ---
 
 ## 1) Authentication
@@ -73,6 +97,10 @@ curl "$SUPABASE_URL/rest/v1/raid_bosses?select=*&order=tier.desc" \
   -H "apikey: $SUPABASE_ANON_KEY" \
   -H "Authorization: Bearer $USER_TOKEN"
 ```
+
+Notes:
+- `raid_bosses` is intentionally public reference data.
+- Explicit SELECT grant is applied for `anon` and `authenticated`.
 
 ---
 

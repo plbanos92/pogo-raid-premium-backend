@@ -2,6 +2,11 @@
 
 Use these checks before integrating frontend flows.
 
+## 0) Recommended quick path (Windows)
+- Fill `supabase/snippets/.env.smoke.local` with service role key + test credentials.
+- Run: `.\\supabase\\snippets\\api_smoke_test.ps1`
+- If this passes, continue with manual checks below.
+
 ## 1) Environment readiness
 - Run: supabase start
 - Run: supabase db reset --local
