@@ -1,0 +1,40 @@
+name: Supabase CI
+
+on:
+  push:
+    paths:
+      - 'supabase/**'
+      - '.github/workflows/supabase-ci.yml'
+  pull_request:
+    paths:
+      - 'supabase/**'
+      - '.github/workflows/supabase-ci.yml'
+
+jobs:
+  db-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Validate required files
+        run: |
+          test -f supabase/config.toml
+          test -f supabase/seed.sql
+          test -f supabase/tests/01_rpc_and_rls.sql
+
+      - name: Start local Supabase stack
+        run: supabase start
+
+      - name: Reset local DB (migrations + seed)
+        run: supabase db reset --local
+
+      - name: Run SQL smoke tests
+        run: psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -f supabase/tests/01_rpc_and_rls.sql

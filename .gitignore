@@ -1,0 +1,6 @@
+supabase/.temp/
+supabase/.branches/
+.env
+.env.*
+!.env.example
+supabase/snippets/.env.smoke.local
