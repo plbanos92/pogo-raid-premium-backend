@@ -19,9 +19,9 @@ function Ensure-Target {
     }
 }
 
-function Invoke-Supabase([string[]]$Args) {
-    Write-Host "> supabase $($Args -join ' ')" -ForegroundColor DarkCyan
-    & supabase @Args
+function Invoke-Supabase([string[]]$CommandArgs) {
+    Write-Host "> supabase $($CommandArgs -join ' ')" -ForegroundColor DarkCyan
+    & supabase $CommandArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Supabase command failed with exit code $LASTEXITCODE"
     }

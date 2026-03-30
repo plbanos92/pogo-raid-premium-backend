@@ -9,6 +9,10 @@ $SMOKE_ENV_FILE = Join-Path $PSScriptRoot ".env.smoke.local"
 $LOADED_ENV_KEYS = New-Object System.Collections.Generic.List[string]
 $ORIGINAL_ENV = @{}
 
+function Section($title) {
+    Write-Host "`n===== $title =====" -ForegroundColor Cyan
+}
+
 function Load-SmokeEnvFile($path) {
     if (-not (Test-Path $path)) {
         return
@@ -67,10 +71,6 @@ $ANON_KEY     = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsIn
 $SERVICE_ROLE_KEY = $env:SUPABASE_SERVICE_ROLE_KEY
 
 $ErrorActionPreference = "Stop"
-
-function Section($title) {
-    Write-Host "`n===== $title =====" -ForegroundColor Cyan
-}
 
 function Http($method, $uri, $authToken = $null, $body = $null) {
     $headers = @{ "apikey" = $ANON_KEY; "Content-Type" = "application/json" }
@@ -238,12 +238,16 @@ try {
     # 7. Join queue via RPC
     # ----------------------------------------------------------
     Section "POST /rest/v1/rpc/join_raid_queue"
-    $SEED_RAID_ID = "00000000-0000-0000-0000-000000000201"
+    $SEED_RAID_ID = "00000000-0000-0000-0000-00000000aa06"
     $queueRow = Http "POST" "$SUPABASE_URL/rest/v1/rpc/join_raid_queue" $ACCESS_TOKEN @{
         p_raid_id = $SEED_RAID_ID
         p_note    = "smoke test join"
     }
     Write-Host ($queueRow | ConvertTo-Json -Depth 5)
+
+    if ($queueRow.status -ne "invited") {
+        throw "Expected auto-filled join to return invited, got $($queueRow.status)"
+    }
 
     Write-Host "`n===== Smoke test complete =====" -ForegroundColor Green
 } finally {

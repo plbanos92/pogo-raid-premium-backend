@@ -29,7 +29,16 @@ port = 54324
 
 [auth]
 enabled = true
-site_url = "http://localhost:3000"
-additional_redirect_urls = ["http://localhost:3000"]
+site_url = "https://pogo-raid-premium.plbanos92.workers.dev"
+additional_redirect_urls = ["https://pogo-raid-premium.plbanos92.workers.dev"]
 jwt_expiry = 3600
 enable_signup = true
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+enable_confirmations = true
+
+[auth.email.template.confirmation]
+subject = "Confirm your email - RaidSync"
+content_path = "./supabase/templates/confirmation.html"
