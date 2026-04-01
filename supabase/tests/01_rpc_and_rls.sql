@@ -7,6 +7,49 @@ INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
 VALUES ('00000000-0000-0000-0000-000000000301', 'Test Boss', 5, 999)
 ON CONFLICT (id) DO NOTHING;
 
+-- Isolated boss for join/rejoin smoke tests. Kept separate from boss 301
+-- so join_boss_queue routing never contaminates boss-301 raid fixtures.
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000304', 'Join Test Boss', 5, 998)
+ON CONFLICT (id) DO NOTHING;
+
+-- Raid 414: the sole open raid for boss 304. join_boss_queue always routes here.
+INSERT INTO public.raids (
+  id, host_user_id, raid_boss_id, location_name, start_time, end_time,
+  capacity, is_active, status
+)
+VALUES (
+  '00000000-0000-0000-0000-000000000414',
+  '00000000-0000-0000-0000-000000000011',
+  '00000000-0000-0000-0000-000000000304',
+  'Join Test Gym',
+  now() + interval '30 minutes',
+  now() + interval '90 minutes',
+  3, true, 'open'
+)
+ON CONFLICT (id) DO NOTHING;
+
+-- Terminal entries in raid 414 used by the rejoin smoke tests.
+-- User 22: 'left'     — exercises the rejoin-after-left path (Test 3a).
+-- User 23: 'cancelled' — exercises the rejoin-after-cancelled path (Test 3b).
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, note)
+VALUES (
+  '00000000-0000-0000-0000-000000000609',
+  '00000000-0000-0000-0000-000000000414',
+  '00000000-0000-0000-0000-000000000022',
+  'left', 1, false, 'smoke-phase3-left-rejoin-304'
+)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, note)
+VALUES (
+  '00000000-0000-0000-0000-000000000610',
+  '00000000-0000-0000-0000-000000000414',
+  '00000000-0000-0000-0000-000000000023',
+  'cancelled', 2, false, 'smoke-phase3-cancelled-rejoin-304'
+)
+ON CONFLICT (id) DO NOTHING;
+
 INSERT INTO public.raids (
   id,
   host_user_id,
@@ -243,7 +286,7 @@ VALUES (
 )
 ON CONFLICT (id) DO NOTHING;
 
--- Raid with is_active=true but status='completed': join_raid_queue must reject it
+-- Raid with is_active=true but status='completed': join_boss_queue must not join it
 -- (tests that the status predicate — not is_active — gates joinability).
 INSERT INTO public.raids (
   id, host_user_id, raid_boss_id, location_name, start_time, end_time,
@@ -351,18 +394,18 @@ DECLARE
   v_queue public.raid_queues%ROWTYPE;
 BEGIN
   SELECT * INTO v_queue
-  FROM public.join_raid_queue('00000000-0000-0000-0000-000000000401', 'smoke-user-join');
+  FROM public.join_boss_queue('00000000-0000-0000-0000-000000000304', 'smoke-user-join');
 
   IF v_queue.user_id <> '00000000-0000-0000-0000-000000000021'::uuid THEN
-    RAISE EXCEPTION 'join_raid_queue returned unexpected user_id';
+    RAISE EXCEPTION 'join_boss_queue returned unexpected user_id';
   END IF;
 
   IF v_queue.status <> 'invited' THEN
-    RAISE EXCEPTION 'join_raid_queue expected status invited, got %', v_queue.status;
+    RAISE EXCEPTION 'join_boss_queue expected status invited, got %', v_queue.status;
   END IF;
 
   IF v_queue.invited_at IS NULL THEN
-    RAISE EXCEPTION 'join_raid_queue expected invited_at to be set for auto-filled join';
+    RAISE EXCEPTION 'join_boss_queue expected invited_at to be set for auto-filled join';
   END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -441,24 +484,24 @@ $$ LANGUAGE plpgsql;
 
 SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000021', true);
 
--- Idempotency check: second join returns same row for same user+raid.
+-- Idempotency check: second join returns same row for same user+boss.
 DO $$
 DECLARE
   v_first public.raid_queues%ROWTYPE;
   v_second public.raid_queues%ROWTYPE;
 BEGIN
   SELECT * INTO v_first
-  FROM public.join_raid_queue('00000000-0000-0000-0000-000000000401', NULL);
+  FROM public.join_boss_queue('00000000-0000-0000-0000-000000000304', NULL);
 
   SELECT * INTO v_second
-  FROM public.join_raid_queue('00000000-0000-0000-0000-000000000401', NULL);
+  FROM public.join_boss_queue('00000000-0000-0000-0000-000000000304', NULL);
 
   IF v_first.id <> v_second.id THEN
-    RAISE EXCEPTION 'join_raid_queue is not idempotent for same user and raid';
+    RAISE EXCEPTION 'join_boss_queue is not idempotent for same user and boss';
   END IF;
 
   IF v_second.status <> 'invited' THEN
-    RAISE EXCEPTION 'join_raid_queue idempotent return expected invited status, got %', v_second.status;
+    RAISE EXCEPTION 'join_boss_queue idempotent return expected invited status, got %', v_second.status;
   END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -553,81 +596,95 @@ $$ LANGUAGE plpgsql;
 -- Phase 3 regression tests: status-predicate enforcement
 -- ─────────────────────────────────────────────────────────────
 
--- Test 1: join_boss_queue must reject a raid in 'raiding' state even when
--- is_active = true.  After Phase 3 the selector uses status IN ('open','lobby');
--- raid 406 has status='raiding' so no eligible raid exists for boss 302.
+-- Test 1: join_boss_queue with only a 'raiding' raid for boss 302 must NOT join
+-- that raid — instead it creates a boss-level queue entry (boss_level_queue
+-- migration changed the fallback path from P0002 raise to boss-level insert).
+-- The selector still uses status IN ('open','lobby'), so no raid is targeted;
+-- the result is a queued boss-level row with raid_id IS NULL.
 SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000021', true);
 
 DO $$
 DECLARE
-  v_caught boolean := false;
+  v_row public.raid_queues%ROWTYPE;
 BEGIN
-  BEGIN
-    PERFORM public.join_boss_queue('00000000-0000-0000-0000-000000000302');
-  EXCEPTION WHEN SQLSTATE 'P0002' THEN
-    v_caught := true;
-  END;
-  IF NOT v_caught THEN
+  SELECT * INTO v_row FROM public.join_boss_queue('00000000-0000-0000-0000-000000000302');
+
+  IF v_row.status <> 'queued' THEN
     RAISE EXCEPTION
-      'Phase 3: join_boss_queue should reject a raiding raid (is_active=true, status=raiding)';
+      'Phase 3: join_boss_queue expected status=queued boss-level entry, got %', v_row.status;
+  END IF;
+  IF v_row.raid_id IS NOT NULL THEN
+    RAISE EXCEPTION
+      'Phase 3: join_boss_queue expected raid_id IS NULL for boss-level entry, got %', v_row.raid_id;
+  END IF;
+  IF v_row.boss_id <> '00000000-0000-0000-0000-000000000302'::uuid THEN
+    RAISE EXCEPTION
+      'Phase 3: join_boss_queue expected boss_id=302, got %', v_row.boss_id;
   END IF;
 END;
 $$ LANGUAGE plpgsql;
 
--- Test 2a: join_raid_queue must reject a raid with status='completed' even when
--- is_active = true (raid 407 is intentionally inconsistent to isolate the predicate).
+-- Test 2a: join_boss_queue with only a raiding raid for boss 302 must NOT join
+-- it — instead falls back to a boss-level queue entry (raid_id IS NULL, status=queued).
+-- Boss 302 fixture only has raid 406 (raiding), so there's no open/lobby slot.
+-- Remove the prior boss-level entry from Test 1 first so we exercise the INSERT path.
 DO $$
 DECLARE
-  v_caught boolean := false;
+  v_row public.raid_queues%ROWTYPE;
 BEGIN
-  BEGIN
-    PERFORM public.join_raid_queue('00000000-0000-0000-0000-000000000407');
-  EXCEPTION WHEN others THEN
-    IF SQLERRM LIKE '%not found%' OR SQLERRM LIKE '%inactive%' THEN
-      v_caught := true;
-    END IF;
-  END;
-  IF NOT v_caught THEN
+  DELETE FROM public.raid_queues
+  WHERE user_id = '00000000-0000-0000-0000-000000000021'
+    AND boss_id = '00000000-0000-0000-0000-000000000302'
+    AND raid_id IS NULL;
+
+  SELECT * INTO v_row FROM public.join_boss_queue('00000000-0000-0000-0000-000000000302');
+
+  IF v_row.status <> 'queued' OR v_row.raid_id IS NOT NULL THEN
     RAISE EXCEPTION
-      'Phase 3: join_raid_queue should reject a completed raid with is_active=true';
+      'Phase 3: join_boss_queue with only a raiding raid must produce boss-level queued entry, got status=% raid_id=%',
+      v_row.status, v_row.raid_id;
   END IF;
 END;
 $$ LANGUAGE plpgsql;
 
--- Test 2b: join_raid_queue must reject a raid with status='cancelled' even when
--- is_active = true (raid 408).
+-- Test 2b: idempotency on boss-level entry — second call returns the same row.
 DO $$
 DECLARE
-  v_caught boolean := false;
+  v_first public.raid_queues%ROWTYPE;
+  v_second public.raid_queues%ROWTYPE;
 BEGIN
-  BEGIN
-    PERFORM public.join_raid_queue('00000000-0000-0000-0000-000000000408');
-  EXCEPTION WHEN others THEN
-    IF SQLERRM LIKE '%not found%' OR SQLERRM LIKE '%inactive%' THEN
-      v_caught := true;
-    END IF;
-  END;
-  IF NOT v_caught THEN
+  SELECT * INTO v_first  FROM public.join_boss_queue('00000000-0000-0000-0000-000000000302');
+  SELECT * INTO v_second FROM public.join_boss_queue('00000000-0000-0000-0000-000000000302');
+
+  IF v_first.id <> v_second.id THEN
     RAISE EXCEPTION
-      'Phase 3: join_raid_queue should reject a cancelled raid with is_active=true';
+      'Phase 3: join_boss_queue boss-level entry is not idempotent, got different ids';
+  END IF;
+
+  IF v_second.status <> 'queued' OR v_second.raid_id IS NOT NULL THEN
+    RAISE EXCEPTION
+      'Phase 3: join_boss_queue idempotent boss-level return expected queued+null raid_id, got status=% raid_id=%',
+      v_second.status, v_second.raid_id;
   END IF;
 END;
 $$ LANGUAGE plpgsql;
 
--- Test 3a: A user who previously left a raid can re-join it while it is open.
--- Raid 409 has a pre-seeded 'left' entry for user 21; Phase 3 deletes that
--- stale row and issues a fresh enrollment into 'invited' status.
+-- Test 3a: A user who previously left a raid can re-join it via join_boss_queue.
+-- Raid 414 has a pre-seeded 'left' entry for user 22; join_boss_queue routes
+-- to raid 414 (sole open boss-304 raid), deletes the terminal row, re-inserts as invited.
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000022', true);
+
 DO $$
 DECLARE
   v_queue public.raid_queues%ROWTYPE;
 BEGIN
   SELECT * INTO v_queue
-  FROM public.join_raid_queue(
-    '00000000-0000-0000-0000-000000000409',
+  FROM public.join_boss_queue(
+    '00000000-0000-0000-0000-000000000304',
     'smoke-phase3-left-rejoin'
   );
 
-  IF v_queue.user_id <> '00000000-0000-0000-0000-000000000021'::uuid THEN
+  IF v_queue.user_id <> '00000000-0000-0000-0000-000000000022'::uuid THEN
     RAISE EXCEPTION 'Phase 3: left-rejoin returned unexpected user_id';
   END IF;
 
@@ -641,22 +698,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Test 3b: A user whose queue slot was 'cancelled' can also re-join an open raid.
--- Raid 409 has a pre-seeded 'cancelled' entry for user 22; this is the primary
--- regression caught by change 1b (cancelled was previously treated as a blocker).
-SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000022', true);
+-- Test 3b: A user whose queue slot was 'cancelled' can also re-join an open raid
+-- via join_boss_queue. Raid 414 has a pre-seeded 'cancelled' entry for user 23.
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000023', true);
 
 DO $$
 DECLARE
   v_queue public.raid_queues%ROWTYPE;
 BEGIN
   SELECT * INTO v_queue
-  FROM public.join_raid_queue(
-    '00000000-0000-0000-0000-000000000409',
+  FROM public.join_boss_queue(
+    '00000000-0000-0000-0000-000000000304',
     'smoke-phase3-cancelled-rejoin'
   );
 
-  IF v_queue.user_id <> '00000000-0000-0000-0000-000000000022'::uuid THEN
+  IF v_queue.user_id <> '00000000-0000-0000-0000-000000000023'::uuid THEN
     RAISE EXCEPTION 'Phase 3: cancelled-rejoin returned unexpected user_id';
   END IF;
 
@@ -730,7 +786,7 @@ VALUES (
   '00000000-0000-0000-0000-000000000691',
   '00000000-0000-0000-0000-000000000411',
   '00000000-0000-0000-0000-000000000026',
-  'invited',
+  'confirmed',
   1,
   false,
   'smoke-phase2-cancel',
@@ -1031,5 +1087,1370 @@ BEGIN
   END IF;
 END;
 $$ LANGUAGE plpgsql;
+
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- Realtime feature: claim_realtime_slot, release_realtime_slot,
+-- admin_update_realtime_slots guard, get_realtime_slot_stats
+-- ─────────────────────────────────────────────────────────────
+
+BEGIN;
+
+-- realtime_sessions.user_id has FK → auth.users(id).
+-- Seed user 021 so claim_realtime_slot can insert without FK violation.
+INSERT INTO auth.users (
+  id, instance_id, aud, role, email,
+  encrypted_password, email_confirmed_at,
+  created_at, updated_at,
+  raw_app_meta_data, raw_user_meta_data,
+  is_sso_user, is_anonymous
+) VALUES (
+  '00000000-0000-0000-0000-000000000021',
+  '00000000-0000-0000-0000-000000000000',
+  'authenticated', 'authenticated',
+  'smoke-user-021@raidsync.local',
+  '', now(), now(), now(),
+  '{"provider":"email","providers":["email"]}'::jsonb,
+  '{}'::jsonb,
+  false, false
+) ON CONFLICT (id) DO NOTHING;
+
+SET LOCAL ROLE authenticated;
+
+-- Test R1: claim_realtime_slot() → granted=true, mode='realtime'
+-- User 021 is non-VIP; active session count starts at 0 (< default 150 slots).
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000021', true);
+
+DO $$
+DECLARE
+  v_result jsonb;
+BEGIN
+  SELECT public.claim_realtime_slot() INTO v_result;
+  IF NOT (v_result->>'granted')::boolean THEN
+    RAISE EXCEPTION 'Realtime R1: claim_realtime_slot expected granted=true, got %', v_result;
+  END IF;
+  IF v_result->>'mode' <> 'realtime' THEN
+    RAISE EXCEPTION 'Realtime R1: claim_realtime_slot expected mode=realtime, got %', v_result->>'mode';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test R2: release_realtime_slot() → session row removed for caller.
+-- Depends on R1 having written a session row for user 021.
+DO $$
+DECLARE
+  v_count int;
+BEGIN
+  PERFORM public.release_realtime_slot();
+  SELECT COUNT(*) INTO v_count
+  FROM public.realtime_sessions
+  WHERE user_id = '00000000-0000-0000-0000-000000000021';
+  IF v_count <> 0 THEN
+    RAISE EXCEPTION 'Realtime R2: release_realtime_slot expected 0 rows after release, found %', v_count;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test R4: get_realtime_slot_stats() → used >= 0, total = 150 (default).
+-- Runs after R2 (release), so this user holds no session; used reflects other rows.
+DO $$
+DECLARE
+  v_stats jsonb;
+BEGIN
+  SELECT public.get_realtime_slot_stats() INTO v_stats;
+  IF (v_stats->>'used')::int < 0 THEN
+    RAISE EXCEPTION 'Realtime R4: used must be >= 0, got %', v_stats->>'used';
+  END IF;
+  IF (v_stats->>'total') IS NULL OR (v_stats->>'total')::int <> 150 THEN
+    RAISE EXCEPTION 'Realtime R4: total must = 150 (default realtime_slots), got %', v_stats->>'total';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test R3: admin_update_realtime_slots() → raises Unauthorized for non-admin caller.
+-- User 021 has no user_profiles row with is_admin=true (column defaults false).
+-- The function must raise EXCEPTION 'Unauthorized' before touching app_config.
+DO $$
+DECLARE
+  v_caught boolean := false;
+BEGIN
+  BEGIN
+    PERFORM public.admin_update_realtime_slots(5);
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM LIKE '%Unauthorized%' THEN
+      v_caught := true;
+    END IF;
+  END;
+  IF NOT v_caught THEN
+    RAISE EXCEPTION 'Realtime R3: admin_update_realtime_slots must raise Unauthorized for non-admin user';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+ROLLBACK;
+
+-- ============================================================
+-- Session Audit Trail Tests
+-- Users: A = 00000000-0000-0000-0000-000000000021
+--        B = 00000000-0000-0000-0000-000000000022
+-- ============================================================
+
+BEGIN;
+
+SET LOCAL ROLE authenticated;
+
+-- Test SA-1: open_user_session returns a UUID when called as user A
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000021', true);
+
+DO $$
+DECLARE
+  v_session_id uuid;
+BEGIN
+  SELECT public.open_user_session(
+    'Mozilla/5.0 (smoke test)',
+    '{"tab_id":"sa-test","screen_w":1920,"screen_h":1080}'::jsonb
+  ) INTO v_session_id;
+
+  IF v_session_id IS NULL THEN
+    RAISE EXCEPTION 'SA-1: open_user_session returned NULL';
+  END IF;
+
+  -- Store session_id for use in subsequent tests within this transaction
+  PERFORM set_config('sa.session_id_a', v_session_id::text, true);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-2: user A can SELECT their own user_sessions row (RLS positive)
+DO $$
+DECLARE
+  v_count int;
+BEGIN
+  SELECT COUNT(*) INTO v_count
+  FROM public.user_sessions
+  WHERE id = current_setting('sa.session_id_a')::uuid;
+
+  IF v_count <> 1 THEN
+    RAISE EXCEPTION 'SA-2: user A should see own session row, count=%', v_count;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-3: user B cannot SELECT user A's user_sessions row (RLS negative)
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000022', true);
+
+DO $$
+DECLARE
+  v_count int;
+BEGIN
+  SELECT COUNT(*) INTO v_count
+  FROM public.user_sessions
+  WHERE id = current_setting('sa.session_id_a')::uuid;
+
+  IF v_count <> 0 THEN
+    RAISE EXCEPTION 'SA-3: RLS leak — user B can see user A session, count=%', v_count;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-4: batch_insert_session_events inserts events for owned session
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000021', true);
+
+DO $$
+DECLARE
+  v_session_id uuid;
+  v_count int;
+BEGIN
+  v_session_id := current_setting('sa.session_id_a')::uuid;
+
+  PERFORM public.batch_insert_session_events(
+    v_session_id,
+    '[
+      {"seq":1,"event_type":"session","event_name":"session.opened","payload":{}},
+      {"seq":2,"event_type":"nav","event_name":"nav.view_switch","payload":{"view":"queues"}}
+    ]'::jsonb
+  );
+
+  SELECT COUNT(*) INTO v_count
+  FROM public.session_events
+  WHERE session_id = v_session_id;
+
+  IF v_count <> 2 THEN
+    RAISE EXCEPTION 'SA-4: expected 2 events inserted, got %', v_count;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-5: batch_insert_session_events raises on wrong session_id (other user's session)
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000022', true);
+
+DO $$
+DECLARE
+  v_session_id uuid;
+  v_caught boolean := false;
+BEGIN
+  v_session_id := current_setting('sa.session_id_a')::uuid;
+
+  BEGIN
+    PERFORM public.batch_insert_session_events(
+      v_session_id,
+      '[{"seq":99,"event_type":"nav","event_name":"nav.view_switch","payload":{}}]'::jsonb
+    );
+  EXCEPTION
+    WHEN SQLSTATE '42501' THEN
+      v_caught := true;
+    WHEN OTHERS THEN
+      IF SQLERRM LIKE '%access denied%' OR SQLERRM LIKE '%not found%' THEN
+        v_caught := true;
+      END IF;
+  END;
+
+  IF NOT v_caught THEN
+    RAISE EXCEPTION 'SA-5: batch_insert_session_events should reject cross-user session_id';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-6: close_user_session sets ended_at + end_reason
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000021', true);
+
+DO $$
+DECLARE
+  v_session_id uuid;
+  v_row public.user_sessions%ROWTYPE;
+BEGIN
+  v_session_id := current_setting('sa.session_id_a')::uuid;
+
+  PERFORM public.close_user_session(v_session_id, 'sign_out', '[]'::jsonb);
+
+  SELECT * INTO v_row FROM public.user_sessions WHERE id = v_session_id;
+
+  IF v_row.ended_at IS NULL THEN
+    RAISE EXCEPTION 'SA-6: close_user_session did not set ended_at';
+  END IF;
+  IF v_row.end_reason <> 'sign_out' THEN
+    RAISE EXCEPTION 'SA-6: close_user_session expected end_reason=sign_out, got %', v_row.end_reason;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-7: close_user_session with p_final_events flushes remaining buffer
+-- Opens a fresh session so ended_at IS NULL guard is valid.
+DO $$
+DECLARE
+  v_session_id uuid;
+  v_count int;
+BEGIN
+  SELECT public.open_user_session('smoke-final-flush', '{}'::jsonb) INTO v_session_id;
+
+  PERFORM public.close_user_session(
+    v_session_id,
+    'page_close',
+    '[{"seq":1,"event_type":"session","event_name":"session.closed","payload":{}}]'::jsonb
+  );
+
+  SELECT COUNT(*) INTO v_count
+  FROM public.session_events
+  WHERE session_id = v_session_id;
+
+  IF v_count <> 1 THEN
+    RAISE EXCEPTION 'SA-7: expected 1 final event flushed by close_user_session, got %', v_count;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-8: user cannot DELETE session_events rows (no DELETE policy)
+-- RLS with no DELETE policy silently returns 0 rows deleted — no error raised.
+DO $$
+DECLARE
+  v_session_id  uuid;
+  v_rows_before int;
+  v_rows_after  int;
+BEGIN
+  SELECT public.open_user_session('smoke-delete-test', '{}'::jsonb) INTO v_session_id;
+
+  PERFORM public.batch_insert_session_events(
+    v_session_id,
+    '[{"seq":1,"event_type":"nav","event_name":"nav.view_switch","payload":{}}]'::jsonb
+  );
+
+  SELECT COUNT(*) INTO v_rows_before FROM public.session_events WHERE session_id = v_session_id;
+
+  -- Direct DELETE: no DELETE policy exists, so 0 rows are deleted (RLS default deny)
+  DELETE FROM public.session_events WHERE session_id = v_session_id;
+
+  SELECT COUNT(*) INTO v_rows_after FROM public.session_events WHERE session_id = v_session_id;
+
+  IF v_rows_after <> v_rows_before THEN
+    RAISE EXCEPTION 'SA-8: RLS DELETE leak — rows before=%, after=% (DELETE should be blocked)', v_rows_before, v_rows_after;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-9: get_session_replay returns correct shape (session + profile + events + state_transitions)
+DO $$
+DECLARE
+  v_session_id uuid;
+  v_replay jsonb;
+BEGIN
+  SELECT public.open_user_session('smoke-replay-test', '{}'::jsonb) INTO v_session_id;
+
+  PERFORM public.batch_insert_session_events(
+    v_session_id,
+    '[{"seq":1,"event_type":"nav","event_name":"nav.view_switch","payload":{"view":"home"}}]'::jsonb
+  );
+
+  SELECT public.get_session_replay(v_session_id) INTO v_replay;
+
+  IF v_replay IS NULL THEN
+    RAISE EXCEPTION 'SA-9: get_session_replay returned NULL';
+  END IF;
+  IF v_replay->>'session' IS NULL THEN
+    RAISE EXCEPTION 'SA-9: get_session_replay missing session key';
+  END IF;
+  IF v_replay->'events' IS NULL THEN
+    RAISE EXCEPTION 'SA-9: get_session_replay missing events key';
+  END IF;
+  IF jsonb_array_length(v_replay->'events') <> 1 THEN
+    RAISE EXCEPTION 'SA-9: expected 1 event in replay, got %', jsonb_array_length(v_replay->'events');
+  END IF;
+  IF v_replay->'state_transitions' IS NULL THEN
+    RAISE EXCEPTION 'SA-9: get_session_replay missing state_transitions key';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-10: UNIQUE(session_id, seq) — duplicate seq ON CONFLICT DO NOTHING (idempotent flush)
+DO $$
+DECLARE
+  v_session_id   uuid;
+  v_count_before int;
+  v_count_after  int;
+BEGIN
+  SELECT public.open_user_session('smoke-idempotent', '{}'::jsonb) INTO v_session_id;
+
+  -- First insert: seq=1
+  PERFORM public.batch_insert_session_events(
+    v_session_id,
+    '[{"seq":1,"event_type":"nav","event_name":"nav.view_switch","payload":{}}]'::jsonb
+  );
+
+  SELECT COUNT(*) INTO v_count_before FROM public.session_events WHERE session_id = v_session_id;
+
+  -- Duplicate seq=1: should be silently ignored via ON CONFLICT DO NOTHING
+  PERFORM public.batch_insert_session_events(
+    v_session_id,
+    '[{"seq":1,"event_type":"nav","event_name":"nav.view_switch","payload":{}}]'::jsonb
+  );
+
+  SELECT COUNT(*) INTO v_count_after FROM public.session_events WHERE session_id = v_session_id;
+
+  IF v_count_after <> v_count_before THEN
+    RAISE EXCEPTION 'SA-10: idempotent flush failed — before=%, after=% (duplicate seq must be skipped)', v_count_before, v_count_after;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- SA-11: admin_update_audit_config — admin guard + success path
+-- ─────────────────────────────────────────────────────────────
+
+BEGIN;
+
+-- Fixture: seed auth.users row for user 011 (admin) and user 021 (non-admin)
+-- so user_profiles FK and admin check work.
+INSERT INTO auth.users (
+  id, instance_id, aud, role, email,
+  encrypted_password, email_confirmed_at,
+  created_at, updated_at,
+  raw_app_meta_data, raw_user_meta_data,
+  is_sso_user, is_anonymous
+) VALUES
+  (
+    '00000000-0000-0000-0000-000000000011',
+    '00000000-0000-0000-0000-000000000000',
+    'authenticated', 'authenticated',
+    'smoke-host-011@raidsync.local',
+    '', now(), now(), now(),
+    '{"provider":"email","providers":["email"]}'::jsonb,
+    '{}'::jsonb,
+    false, false
+  ),
+  (
+    '00000000-0000-0000-0000-000000000021',
+    '00000000-0000-0000-0000-000000000000',
+    'authenticated', 'authenticated',
+    'smoke-user-021@raidsync.local',
+    '', now(), now(), now(),
+    '{"provider":"email","providers":["email"]}'::jsonb,
+    '{}'::jsonb,
+    false, false
+  )
+ON CONFLICT (id) DO NOTHING;
+
+-- Seed user_profiles: user 011 = admin, user 021 = non-admin
+INSERT INTO public.user_profiles (auth_id, is_admin)
+VALUES
+  ('00000000-0000-0000-0000-000000000011', true),
+  ('00000000-0000-0000-0000-000000000021', false)
+ON CONFLICT (auth_id) DO UPDATE SET is_admin = EXCLUDED.is_admin;
+
+SET LOCAL ROLE authenticated;
+
+-- Test SA-11a: non-admin calling admin_update_audit_config raises Unauthorized
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000021', true);
+
+DO $$
+DECLARE
+  v_caught boolean := false;
+BEGIN
+  BEGIN
+    PERFORM public.admin_update_audit_config('{
+      "enabled": true,
+      "categories": { "session": true, "error": true }
+    }'::jsonb);
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM LIKE '%Unauthorized%' THEN
+      v_caught := true;
+    END IF;
+  END;
+  IF NOT v_caught THEN
+    RAISE EXCEPTION 'SA-11a: admin_update_audit_config must raise Unauthorized for non-admin user';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-11b: admin calling admin_update_audit_config succeeds and column updates
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+DO $$
+DECLARE
+  v_config jsonb;
+BEGIN
+  PERFORM public.admin_update_audit_config('{
+    "enabled": false,
+    "flush_interval_ms": 10000,
+    "buffer_max": 100,
+    "categories": {
+      "session": true,
+      "error": true,
+      "nav": true,
+      "queue": false,
+      "host": false,
+      "lifecycle": false,
+      "realtime": false,
+      "data": false,
+      "account": false,
+      "admin": false
+    }
+  }'::jsonb);
+
+  SELECT audit_config INTO v_config FROM public.app_config WHERE id = 1;
+
+  IF v_config IS NULL THEN
+    RAISE EXCEPTION 'SA-11b: audit_config is NULL after admin update';
+  END IF;
+  IF (v_config->>'enabled')::boolean <> false THEN
+    RAISE EXCEPTION 'SA-11b: expected enabled=false, got %', v_config->>'enabled';
+  END IF;
+  IF (v_config->>'flush_interval_ms')::int <> 10000 THEN
+    RAISE EXCEPTION 'SA-11b: expected flush_interval_ms=10000, got %', v_config->>'flush_interval_ms';
+  END IF;
+  IF (v_config->'categories'->>'nav')::boolean <> true THEN
+    RAISE EXCEPTION 'SA-11b: expected categories.nav=true, got %', v_config->'categories'->>'nav';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+ROLLBACK;
+
+
+-- SA-12: admin_purge_audit_trail � admin guard + success path
+-- -------------------------------------------------------------
+
+BEGIN;
+
+-- Fixture: seed auth.users row for user 011 (admin) and user 021 (non-admin).
+-- SA-11 seeds and rolls back these rows, so SA-12 must re-seed them.
+INSERT INTO auth.users (
+  id, instance_id, aud, role, email,
+  encrypted_password, email_confirmed_at,
+  created_at, updated_at,
+  raw_app_meta_data, raw_user_meta_data,
+  is_sso_user, is_anonymous
+) VALUES
+  (
+    '00000000-0000-0000-0000-000000000011',
+    '00000000-0000-0000-0000-000000000000',
+    'authenticated', 'authenticated',
+    'smoke-host-011@raidsync.local',
+    '', now(), now(), now(),
+    '{"provider":"email","providers":["email"]}'::jsonb,
+    '{}'::jsonb,
+    false, false
+  ),
+  (
+    '00000000-0000-0000-0000-000000000021',
+    '00000000-0000-0000-0000-000000000000',
+    'authenticated', 'authenticated',
+    'smoke-user-021@raidsync.local',
+    '', now(), now(), now(),
+    '{"provider":"email","providers":["email"]}'::jsonb,
+    '{}'::jsonb,
+    false, false
+  )
+ON CONFLICT (id) DO NOTHING;
+
+-- Seed user_profiles: user 011 = admin, user 021 = non-admin
+INSERT INTO public.user_profiles (auth_id, is_admin)
+VALUES
+  ('00000000-0000-0000-0000-000000000011', true),
+  ('00000000-0000-0000-0000-000000000021', false)
+ON CONFLICT (auth_id) DO UPDATE SET is_admin = EXCLUDED.is_admin;
+
+SET LOCAL ROLE authenticated;
+
+-- Test SA-12a: non-admin calling admin_purge_audit_trail raises Unauthorized
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000021', true);
+
+DO $$
+DECLARE
+  v_caught boolean := false;
+BEGIN
+  BEGIN
+    PERFORM public.admin_purge_audit_trail('anyone@example.com');
+  EXCEPTION WHEN SQLSTATE '42501' THEN
+    v_caught := true;
+  END;
+  IF NOT v_caught THEN
+    RAISE EXCEPTION 'SA-12a: admin_purge_audit_trail must raise 42501 for non-admin user';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-12b: admin calling with a nonexistent email raises "User not found"
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+DO $$
+DECLARE
+  v_caught boolean := false;
+BEGIN
+  BEGIN
+    PERFORM public.admin_purge_audit_trail('nonexistent@raidsync.local');
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM LIKE '%User not found%' THEN
+      v_caught := true;
+    END IF;
+  END;
+  IF NOT v_caught THEN
+    RAISE EXCEPTION 'SA-12b: admin_purge_audit_trail must raise "User not found" for unknown email';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Test SA-12c: admin calling admin_purge_audit_trail(NULL) succeeds (purge all)
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+DO $$
+DECLARE
+  v_result jsonb;
+BEGIN
+  SELECT public.admin_purge_audit_trail(NULL) INTO v_result;
+  IF v_result IS NULL THEN
+    RAISE EXCEPTION 'SA-12c: admin_purge_audit_trail(NULL) returned NULL';
+  END IF;
+  IF v_result->>'target' <> 'ALL' THEN
+    RAISE EXCEPTION 'SA-12c: expected target=ALL, got %', v_result->>'target';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN RAISE NOTICE 'SA-12: admin_purge_audit_trail � all assertions passed'; END; $$;
+
+ROLLBACK;
+
+-- ============================================================
+-- invite_attempts smoke tests
+-- ============================================================
+
+-- Test IA-1: Expire → tail (joined_at = now()) → auto-promote next queued user
+BEGIN;
+
+-- Fixture: boss, raid (open, capacity 5), auth.users for host + 2 joiners
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000301', 'Test Boss', 5, 999)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO auth.users (
+  id, instance_id, aud, role, email,
+  encrypted_password, email_confirmed_at,
+  created_at, updated_at,
+  raw_app_meta_data, raw_user_meta_data,
+  is_sso_user, is_anonymous
+) VALUES
+  (
+    '00000000-0000-0000-0000-000000000011',
+    '00000000-0000-0000-0000-000000000000',
+    'authenticated', 'authenticated',
+    'smoke-host-011@raidsync.local',
+    '', now(), now(), now(),
+    '{"provider":"email","providers":["email"]}'::jsonb,
+    '{}'::jsonb,
+    false, false
+  ),
+  (
+    '00000000-0000-0000-0000-000000000021',
+    '00000000-0000-0000-0000-000000000000',
+    'authenticated', 'authenticated',
+    'smoke-user-021@raidsync.local',
+    '', now(), now(), now(),
+    '{"provider":"email","providers":["email"]}'::jsonb,
+    '{}'::jsonb,
+    false, false
+  ),
+  (
+    '00000000-0000-0000-0000-000000000022',
+    '00000000-0000-0000-0000-000000000000',
+    'authenticated', 'authenticated',
+    'smoke-user-022@raidsync.local',
+    '', now(), now(), now(),
+    '{"provider":"email","providers":["email"]}'::jsonb,
+    '{}'::jsonb,
+    false, false
+  )
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raids (
+  id, host_user_id, raid_boss_id, location_name,
+  start_time, end_time, capacity, is_active, status
+) VALUES (
+  '00000000-0000-0000-0000-000000000801',
+  '00000000-0000-0000-0000-000000000011',
+  '00000000-0000-0000-0000-000000000301',
+  'IA Test Gym',
+  now() + interval '30 minutes',
+  now() + interval '90 minutes',
+  5, true, 'open'
+) ON CONFLICT (id) DO NOTHING;
+
+-- User 21 is invited with expired timer
+INSERT INTO public.raid_queues (
+  id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts
+) VALUES (
+  '00000000-0000-0000-0000-000000000901',
+  '00000000-0000-0000-0000-000000000801',
+  '00000000-0000-0000-0000-000000000021',
+  'invited', 1, false,
+  now() - interval '90 seconds',
+  now() - interval '5 minutes',
+  0
+) ON CONFLICT (id) DO NOTHING;
+
+-- User 22 is next in queue
+INSERT INTO public.raid_queues (
+  id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts
+) VALUES (
+  '00000000-0000-0000-0000-000000000912',
+  '00000000-0000-0000-0000-000000000801',
+  '00000000-0000-0000-0000-000000000022',
+  'queued', 2, false,
+  NULL,
+  now() - interval '4 minutes',
+  0
+) ON CONFLICT (id) DO NOTHING;
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+DO $$
+DECLARE
+  v_count int;
+  v_expired public.raid_queues%ROWTYPE;
+  v_promoted public.raid_queues%ROWTYPE;
+BEGIN
+  SELECT public.expire_stale_invites('00000000-0000-0000-0000-000000000801') INTO v_count;
+  IF v_count <> 1 THEN
+    RAISE EXCEPTION 'IA-1: expected 1 processed, got %', v_count;
+  END IF;
+
+  -- Expired user should be queued at tail (joined_at reset to now())
+  SELECT * INTO v_expired FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000901';
+  IF v_expired.status <> 'queued' THEN
+    RAISE EXCEPTION 'IA-1: expired user expected status=queued, got %', v_expired.status;
+  END IF;
+  IF v_expired.invited_at IS NOT NULL THEN
+    RAISE EXCEPTION 'IA-1: expired user invited_at should be NULL';
+  END IF;
+  -- joined_at should have been reset to now() (tail penalty)
+  IF v_expired.joined_at < now() - interval '5 seconds' THEN
+    RAISE EXCEPTION 'IA-1: expired user joined_at not reset to now() — tail penalty missing';
+  END IF;
+
+  -- Next queued user should be auto-promoted to invited
+  SELECT * INTO v_promoted FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000912';
+  IF v_promoted.status <> 'invited' THEN
+    RAISE EXCEPTION 'IA-1: next queued user expected status=invited (auto-promote), got %', v_promoted.status;
+  END IF;
+  IF v_promoted.invited_at IS NULL THEN
+    RAISE EXCEPTION 'IA-1: promoted user invited_at should not be NULL';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN RAISE NOTICE 'IA-1: expire to tail + auto-promote next — PASSED'; END; $$;
+
+ROLLBACK;
+
+-- Test IA-1b: Solo user expires — should NOT be re-invited (no infinite cycle)
+BEGIN;
+
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000301', 'Test Boss', 5, 999)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data, is_sso_user, is_anonymous)
+VALUES
+  ('00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-host-011@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-021@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raids (id, host_user_id, raid_boss_id, location_name, start_time, end_time, capacity, is_active, status)
+VALUES ('00000000-0000-0000-0000-000000000810', '00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000301', 'IA-1b Solo Gym', now() + interval '30 minutes', now() + interval '90 minutes', 5, true, 'open')
+ON CONFLICT (id) DO NOTHING;
+
+-- Only user in queue, invited and expired
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000915', '00000000-0000-0000-0000-000000000810', '00000000-0000-0000-0000-000000000021', 'invited', 1, false, now() - interval '90 seconds', now() - interval '5 minutes', 0)
+ON CONFLICT (id) DO NOTHING;
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+DO $$
+DECLARE
+  v_count int;
+  v_row public.raid_queues%ROWTYPE;
+BEGIN
+  SELECT public.expire_stale_invites('00000000-0000-0000-0000-000000000810') INTO v_count;
+  IF v_count <> 1 THEN
+    RAISE EXCEPTION 'IA-1b: expected 1 processed, got %', v_count;
+  END IF;
+
+  SELECT * INTO v_row FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000915';
+  -- Must stay queued — NOT re-invited (that would be an infinite cycle)
+  IF v_row.status <> 'queued' THEN
+    RAISE EXCEPTION 'IA-1b: solo user expected status=queued, got % (infinite cycle!)', v_row.status;
+  END IF;
+  IF v_row.invited_at IS NOT NULL THEN
+    RAISE EXCEPTION 'IA-1b: solo user invited_at should be NULL after expire';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN RAISE NOTICE 'IA-1b: solo user expire — no infinite cycle — PASSED'; END; $$;
+
+ROLLBACK;
+
+-- Test IA-2: user_confirm_invite resets invite_attempts to 0
+BEGIN;
+
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000301', 'Test Boss', 5, 999)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data, is_sso_user, is_anonymous)
+VALUES ('00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-021@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raids (id, host_user_id, raid_boss_id, location_name, start_time, end_time, capacity, is_active, status)
+VALUES ('00000000-0000-0000-0000-000000000802', '00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000301', 'IA-2 Gym', now() + interval '30 minutes', now() + interval '90 minutes', 5, true, 'open')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000902', '00000000-0000-0000-0000-000000000802', '00000000-0000-0000-0000-000000000021', 'invited', 1, false, now(), now() - interval '5 minutes', 2)
+ON CONFLICT (id) DO NOTHING;
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000021', true);
+
+DO $$
+DECLARE
+  v_row public.raid_queues%ROWTYPE;
+BEGIN
+  SELECT * INTO v_row FROM public.user_confirm_invite('00000000-0000-0000-0000-000000000902');
+  IF v_row.status <> 'confirmed' THEN
+    RAISE EXCEPTION 'IA-2: expected status=confirmed, got %', v_row.status;
+  END IF;
+  IF v_row.invite_attempts <> 0 THEN
+    RAISE EXCEPTION 'IA-2: expected invite_attempts=0 after confirm, got %', v_row.invite_attempts;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN RAISE NOTICE 'IA-2: confirm resets counter — PASSED'; END; $$;
+
+ROLLBACK;
+
+-- Test IA-3: host_invite_next_in_queue resets invite_attempts to 0
+BEGIN;
+
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000301', 'Test Boss', 5, 999)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data, is_sso_user, is_anonymous)
+VALUES
+  ('00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-host-011@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-021@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raids (id, host_user_id, raid_boss_id, location_name, start_time, end_time, capacity, is_active, status)
+VALUES ('00000000-0000-0000-0000-000000000803', '00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000301', 'IA-3 Gym', now() + interval '30 minutes', now() + interval '90 minutes', 5, true, 'open')
+ON CONFLICT (id) DO NOTHING;
+
+-- User is queued with invite_attempts=3 (simulates cap-hit requeue)
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000903', '00000000-0000-0000-0000-000000000803', '00000000-0000-0000-0000-000000000021', 'queued', 1, false, NULL, now() - interval '5 minutes', 3)
+ON CONFLICT (id) DO NOTHING;
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+DO $$
+DECLARE
+  v_row public.raid_queues%ROWTYPE;
+BEGIN
+  SELECT * INTO v_row FROM public.host_invite_next_in_queue('00000000-0000-0000-0000-000000000803');
+  IF v_row.status <> 'invited' THEN
+    RAISE EXCEPTION 'IA-3: expected status=invited, got %', v_row.status;
+  END IF;
+  IF v_row.invite_attempts <> 0 THEN
+    RAISE EXCEPTION 'IA-3: expected invite_attempts=0 after host invite, got %', v_row.invite_attempts;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN RAISE NOTICE 'IA-3: host invite resets counter — PASSED'; END; $$;
+
+ROLLBACK;
+
+-- Test IA-4: promote_next_queued_user resets invite_attempts to 0
+BEGIN;
+
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000301', 'Test Boss', 5, 999)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data, is_sso_user, is_anonymous)
+VALUES
+  ('00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-host-011@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-021@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raids (id, host_user_id, raid_boss_id, location_name, start_time, end_time, capacity, is_active, status)
+VALUES ('00000000-0000-0000-0000-000000000804', '00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000301', 'IA-4 Gym', now() + interval '30 minutes', now() + interval '90 minutes', 5, true, 'open')
+ON CONFLICT (id) DO NOTHING;
+
+-- User is queued with invite_attempts=3 (capped)
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000904', '00000000-0000-0000-0000-000000000804', '00000000-0000-0000-0000-000000000021', 'queued', 1, false, NULL, now() - interval '5 minutes', 3)
+ON CONFLICT (id) DO NOTHING;
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+DO $$
+DECLARE
+  v_row public.raid_queues%ROWTYPE;
+BEGIN
+  PERFORM public.promote_next_queued_user('00000000-0000-0000-0000-000000000804');
+
+  SELECT * INTO v_row FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000904';
+  IF v_row.status <> 'invited' THEN
+    RAISE EXCEPTION 'IA-4: expected status=invited after promote, got %', v_row.status;
+  END IF;
+  IF v_row.invite_attempts <> 0 THEN
+    RAISE EXCEPTION 'IA-4: expected invite_attempts=0 after promote, got %', v_row.invite_attempts;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN RAISE NOTICE 'IA-4: promote resets counter — PASSED'; END; $$;
+
+ROLLBACK;
+
+-- Test IA-5: Raid full (confirmed = capacity) → expired entry reverts to queued
+BEGIN;
+
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000301', 'Test Boss', 5, 999)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data, is_sso_user, is_anonymous)
+VALUES
+  ('00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-host-011@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-021@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000022', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-022@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false)
+ON CONFLICT (id) DO NOTHING;
+
+-- Raid with capacity=1
+INSERT INTO public.raids (id, host_user_id, raid_boss_id, location_name, start_time, end_time, capacity, is_active, status)
+VALUES ('00000000-0000-0000-0000-000000000805', '00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000301', 'IA-5 Full Gym', now() + interval '30 minutes', now() + interval '90 minutes', 1, true, 'open')
+ON CONFLICT (id) DO NOTHING;
+
+-- One confirmed user fills capacity
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000905', '00000000-0000-0000-0000-000000000805', '00000000-0000-0000-0000-000000000022', 'confirmed', 1, false, now() - interval '2 minutes', now() - interval '10 minutes', 0)
+ON CONFLICT (id) DO NOTHING;
+
+-- Expired invited user at invite_attempts=0
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000906', '00000000-0000-0000-0000-000000000805', '00000000-0000-0000-0000-000000000021', 'invited', 2, false, now() - interval '90 seconds', now() - interval '5 minutes', 0)
+ON CONFLICT (id) DO NOTHING;
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+DO $$
+DECLARE
+  v_count int;
+  v_row public.raid_queues%ROWTYPE;
+BEGIN
+  SELECT public.expire_stale_invites('00000000-0000-0000-0000-000000000805') INTO v_count;
+  IF v_count <> 1 THEN
+    RAISE EXCEPTION 'IA-5: expected 1 processed, got %', v_count;
+  END IF;
+
+  SELECT * INTO v_row FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000906';
+  IF v_row.status <> 'queued' THEN
+    RAISE EXCEPTION 'IA-5: expected status=queued (raid full), got %', v_row.status;
+  END IF;
+  -- joined_at should be reset to now() (tail penalty)
+  IF v_row.joined_at < now() - interval '5 seconds' THEN
+    RAISE EXCEPTION 'IA-5: joined_at not reset — tail penalty missing';
+  END IF;
+  -- No auto-promote should happen since raid is full
+  IF EXISTS (SELECT 1 FROM public.raid_queues WHERE raid_id = '00000000-0000-0000-0000-000000000805' AND status = 'invited') THEN
+    RAISE EXCEPTION 'IA-5: should not auto-promote when raid is full';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN RAISE NOTICE 'IA-5: raid full revert — PASSED'; END; $$;
+
+ROLLBACK;
+
+-- Test IA-6: Raid closed (status not in open/lobby) → expired entry reverts to queued
+BEGIN;
+
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000301', 'Test Boss', 5, 999)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data, is_sso_user, is_anonymous)
+VALUES
+  ('00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-host-011@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-021@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false)
+ON CONFLICT (id) DO NOTHING;
+
+-- Raid with status='raiding' (not open/lobby)
+INSERT INTO public.raids (id, host_user_id, raid_boss_id, location_name, start_time, end_time, capacity, is_active, status)
+VALUES ('00000000-0000-0000-0000-000000000806', '00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000301', 'IA-6 Closed Gym', now() + interval '30 minutes', now() + interval '90 minutes', 5, true, 'raiding')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000907', '00000000-0000-0000-0000-000000000806', '00000000-0000-0000-0000-000000000021', 'invited', 1, false, now() - interval '90 seconds', now() - interval '5 minutes', 0)
+ON CONFLICT (id) DO NOTHING;
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+DO $$
+DECLARE
+  v_count int;
+  v_row public.raid_queues%ROWTYPE;
+BEGIN
+  SELECT public.expire_stale_invites('00000000-0000-0000-0000-000000000806') INTO v_count;
+  IF v_count <> 1 THEN
+    RAISE EXCEPTION 'IA-6: expected 1 processed, got %', v_count;
+  END IF;
+
+  SELECT * INTO v_row FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000907';
+  IF v_row.status <> 'queued' THEN
+    RAISE EXCEPTION 'IA-6: expected status=queued (raid closed), got %', v_row.status;
+  END IF;
+  -- joined_at should be reset to now() (tail penalty)
+  IF v_row.joined_at < now() - interval '5 seconds' THEN
+    RAISE EXCEPTION 'IA-6: joined_at not reset — tail penalty missing';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN RAISE NOTICE 'IA-6: raid closed revert — PASSED'; END; $$;
+
+ROLLBACK;
+
+-- Test IA-7: Multiple simultaneous expires — all revert to tail, one auto-promoted
+BEGIN;
+
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000301', 'Test Boss', 5, 999)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data, is_sso_user, is_anonymous)
+VALUES
+  ('00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-host-011@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-021@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000022', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-022@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000023', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-023@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raids (id, host_user_id, raid_boss_id, location_name, start_time, end_time, capacity, is_active, status)
+VALUES ('00000000-0000-0000-0000-000000000807', '00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000301', 'IA-7 Multi Gym', now() + interval '30 minutes', now() + interval '90 minutes', 5, true, 'open')
+ON CONFLICT (id) DO NOTHING;
+
+-- User 21: expired invited
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000908', '00000000-0000-0000-0000-000000000807', '00000000-0000-0000-0000-000000000021', 'invited', 1, false, now() - interval '90 seconds', now() - interval '10 minutes', 0)
+ON CONFLICT (id) DO NOTHING;
+
+-- User 22: expired invited
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000909', '00000000-0000-0000-0000-000000000807', '00000000-0000-0000-0000-000000000022', 'invited', 2, false, now() - interval '90 seconds', now() - interval '8 minutes', 0)
+ON CONFLICT (id) DO NOTHING;
+
+-- User 23: next in queue (should get auto-promoted)
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000913', '00000000-0000-0000-0000-000000000807', '00000000-0000-0000-0000-000000000023', 'queued', 3, false, NULL, now() - interval '6 minutes', 0)
+ON CONFLICT (id) DO NOTHING;
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+DO $$
+DECLARE
+  v_count int;
+  v_row21 public.raid_queues%ROWTYPE;
+  v_row22 public.raid_queues%ROWTYPE;
+  v_row23 public.raid_queues%ROWTYPE;
+BEGIN
+  SELECT public.expire_stale_invites('00000000-0000-0000-0000-000000000807') INTO v_count;
+  IF v_count <> 2 THEN
+    RAISE EXCEPTION 'IA-7: expected 2 processed, got %', v_count;
+  END IF;
+
+  -- Both expired users should be queued at tail
+  SELECT * INTO v_row21 FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000908';
+  IF v_row21.status <> 'queued' THEN
+    RAISE EXCEPTION 'IA-7: user 21 expected status=queued, got %', v_row21.status;
+  END IF;
+  IF v_row21.joined_at < now() - interval '5 seconds' THEN
+    RAISE EXCEPTION 'IA-7: user 21 joined_at not reset to now()';
+  END IF;
+
+  SELECT * INTO v_row22 FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000909';
+  IF v_row22.status <> 'queued' THEN
+    RAISE EXCEPTION 'IA-7: user 22 expected status=queued, got %', v_row22.status;
+  END IF;
+  IF v_row22.joined_at < now() - interval '5 seconds' THEN
+    RAISE EXCEPTION 'IA-7: user 22 joined_at not reset to now()';
+  END IF;
+
+  -- User 23 should be auto-promoted to invited
+  SELECT * INTO v_row23 FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000913';
+  IF v_row23.status <> 'invited' THEN
+    RAISE EXCEPTION 'IA-7: user 23 expected status=invited (auto-promote), got %', v_row23.status;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN RAISE NOTICE 'IA-7: multiple simultaneous expires + auto-promote — PASSED'; END; $$;
+
+ROLLBACK;
+
+-- Test IA-8: One-invite guard survives after auto-promote
+BEGIN;
+
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000301', 'Test Boss', 5, 999)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data, is_sso_user, is_anonymous)
+VALUES
+  ('00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-host-011@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-021@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000022', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-022@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000023', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-023@raidsync.local', '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raids (id, host_user_id, raid_boss_id, location_name, start_time, end_time, capacity, is_active, status)
+VALUES ('00000000-0000-0000-0000-000000000808', '00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000301', 'IA-8 Guard Gym', now() + interval '30 minutes', now() + interval '90 minutes', 5, true, 'open')
+ON CONFLICT (id) DO NOTHING;
+
+-- User 21 is invited with expired timer
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000910', '00000000-0000-0000-0000-000000000808', '00000000-0000-0000-0000-000000000021', 'invited', 1, false, now() - interval '90 seconds', now() - interval '10 minutes', 0)
+ON CONFLICT (id) DO NOTHING;
+
+-- User 22 is next in queue (will be auto-promoted)
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000911', '00000000-0000-0000-0000-000000000808', '00000000-0000-0000-0000-000000000022', 'queued', 2, false, NULL, now() - interval '8 minutes', 0)
+ON CONFLICT (id) DO NOTHING;
+
+-- User 23 is also queued
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES ('00000000-0000-0000-0000-000000000914', '00000000-0000-0000-0000-000000000808', '00000000-0000-0000-0000-000000000023', 'queued', 3, false, NULL, now() - interval '6 minutes', 0)
+ON CONFLICT (id) DO NOTHING;
+
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+-- Expire triggers auto-promote of user 22
+DO $$
+DECLARE
+  v_row22 public.raid_queues%ROWTYPE;
+BEGIN
+  PERFORM public.expire_stale_invites('00000000-0000-0000-0000-000000000808');
+
+  -- User 22 should now be invited (auto-promoted)
+  SELECT * INTO v_row22 FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000911';
+  IF v_row22.status <> 'invited' THEN
+    RAISE EXCEPTION 'IA-8 setup: user 22 should be auto-promoted to invited, got %', v_row22.status;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- host_invite_next_in_queue should reject because user 22 is now invited (via auto-promote)
+DO $$
+DECLARE
+  v_caught boolean := false;
+BEGIN
+  BEGIN
+    PERFORM public.host_invite_next_in_queue('00000000-0000-0000-0000-000000000808');
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM LIKE '%already invited%' THEN
+      v_caught := true;
+    END IF;
+  END;
+  IF NOT v_caught THEN
+    RAISE EXCEPTION 'IA-8: host_invite_next_in_queue should reject — one-invite guard violated';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN RAISE NOTICE 'IA-8: one-invite guard survives after auto-promote — PASSED'; END; $$;
+
+ROLLBACK;
+
+-- ─────────────────────────────────────────────────────────────
+-- SC tests: status_changed_at heartbeat immunity + raidsVersion
+-- ─────────────────────────────────────────────────────────────
+
+BEGIN;
+
+-- SC test fixture (self-contained — data does not persist between test suites)
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000301', 'Test Boss', 5, 999)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raids (
+  id, host_user_id, raid_boss_id, location_name,
+  start_time, end_time, capacity, is_active, status
+)
+VALUES (
+  '00000000-0000-0000-0000-000000000401',
+  '00000000-0000-0000-0000-000000000011',
+  '00000000-0000-0000-0000-000000000301',
+  'Test Gym',
+  now() + interval '30 minutes',
+  now() + interval '90 minutes',
+  3,
+  true,
+  'open'
+)
+ON CONFLICT (id) DO NOTHING;
+
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+-- ============================================================
+-- SC-1: raidsVersion present and non-null when non-terminal raid exists
+-- ============================================================
+DO $$
+DECLARE v_result jsonb;
+BEGIN
+  SELECT public.get_queue_sync_state(NULL) INTO v_result;
+  IF v_result->>'raidsVersion' IS NULL THEN
+    RAISE EXCEPTION 'SC-1: raidsVersion must be non-null when an active raid exists';
+  END IF;
+END; $$ LANGUAGE plpgsql;
+DO $$ BEGIN RAISE NOTICE 'SC-1: raidsVersion present — PASSED'; END; $$;
+
+-- ============================================================
+-- SC-2: touch_host_activity (heartbeat) does NOT bump raidsVersion
+-- ============================================================
+DO $$
+DECLARE
+  v_before  jsonb;
+  v_after   jsonb;
+  v_touched integer;
+BEGIN
+  SELECT public.get_queue_sync_state(NULL) INTO v_before;
+  UPDATE public.raids
+    SET last_host_action_at = now()
+    WHERE id = '00000000-0000-0000-0000-000000000401'
+      AND host_user_id = '00000000-0000-0000-0000-000000000011'
+      AND is_active = true;
+  GET DIAGNOSTICS v_touched = ROW_COUNT;
+  IF v_touched = 0 THEN
+    RAISE EXCEPTION 'SC-2: touch_host_activity precondition failed — 0 rows updated; test fixture may be wrong';
+  END IF;
+  SELECT public.get_queue_sync_state(NULL) INTO v_after;
+  IF (v_before->>'raidsVersion') IS DISTINCT FROM (v_after->>'raidsVersion') THEN
+    RAISE EXCEPTION 'SC-2: raidsVersion changed after heartbeat UPDATE — heartbeat immunity broken';
+  END IF;
+END; $$ LANGUAGE plpgsql;
+DO $$ BEGIN RAISE NOTICE 'SC-2: heartbeat immunity — PASSED'; END; $$;
+
+-- ============================================================
+-- SC-3: status transition DOES bump raidsVersion
+-- ============================================================
+-- Set status_changed_at to a known past value on ALL non-terminal raids first,
+-- because now() is constant within a BEGIN/ROLLBACK block and the trigger would
+-- produce the same timestamp as the INSERT fixture (both use now()), making the
+-- before/after comparison a no-op. We must reset all non-terminal raids because
+-- get_queue_sync_state returns MAX(status_changed_at) across all of them — seed
+-- data may include other non-terminal raids whose timestamps would mask our
+-- sentinel value.
+UPDATE public.raids
+  SET status_changed_at = '2000-01-01T00:00:00Z'::timestamptz
+  WHERE status NOT IN ('completed', 'cancelled');
+
+DO $$
+DECLARE
+  v_before timestamptz;
+  v_after  timestamptz;
+BEGIN
+  SELECT (public.get_queue_sync_state(NULL)->>'raidsVersion')::timestamptz INTO v_before;
+  IF v_before <> '2000-01-01T00:00:00Z'::timestamptz THEN
+    RAISE EXCEPTION 'SC-3: precondition failed — status_changed_at was not reset to year-2000 sentinel';
+  END IF;
+  -- Force a status transition directly (bypassing RPC auth guards in test context).
+  UPDATE public.raids SET status = 'lobby'::raid_status_enum WHERE id = '00000000-0000-0000-0000-000000000401';
+  SELECT (public.get_queue_sync_state(NULL)->>'raidsVersion')::timestamptz INTO v_after;
+  IF v_after IS NOT DISTINCT FROM v_before THEN
+    RAISE EXCEPTION 'SC-3: raidsVersion did not change after status transition';
+  END IF;
+END; $$ LANGUAGE plpgsql;
+DO $$ BEGIN RAISE NOTICE 'SC-3: status transition bumps raidsVersion — PASSED'; END; $$;
+
+ROLLBACK;
+
+-- ============================================================
+-- ESI-1: boss-queue user gets promoted when invite expires
+-- ============================================================
+-- Scenario: capacity-1 raid, user 21 has an already-expired invite (120s ago),
+-- user 22 is waiting in the boss queue (raid_id IS NULL).
+-- expire_stale_invites should revert user 21 to queued and promote user 22
+-- from the boss queue into the raid.
+-- ============================================================
+BEGIN;
+
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-000000000305', 'Expire Promote Boss', 5, 997)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO auth.users (id, instance_id, aud, role, email, encrypted_password, email_confirmed_at, created_at, updated_at, raw_app_meta_data, raw_user_meta_data, is_sso_user, is_anonymous)
+VALUES
+  ('00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-host-011@raidsync.local',    '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-021@raidsync.local',    '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false),
+  ('00000000-0000-0000-0000-000000000022', '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated', 'smoke-user-022@raidsync.local',    '', now(), now(), now(), '{"provider":"email","providers":["email"]}'::jsonb, '{}'::jsonb, false, false)
+ON CONFLICT (id) DO NOTHING;
+
+-- Open raid with capacity=1 so confirmed(0) < capacity(1) and the slot is free
+INSERT INTO public.raids (
+  id, host_user_id, raid_boss_id, location_name,
+  start_time, end_time, capacity, is_active, status
+)
+VALUES (
+  '00000000-0000-0000-0000-000000000415',
+  '00000000-0000-0000-0000-000000000011',
+  '00000000-0000-0000-0000-000000000305',
+  'ESI-1 Boss Queue Gym',
+  now() + interval '30 minutes',
+  now() + interval '90 minutes',
+  1, true, 'open'
+)
+ON CONFLICT (id) DO NOTHING;
+
+-- User 21: already-expired invite (120 s ago), fills the single invited slot
+INSERT INTO public.raid_queues (id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts)
+VALUES (
+  '00000000-0000-0000-0000-000000000621',
+  '00000000-0000-0000-0000-000000000415',
+  '00000000-0000-0000-0000-000000000021',
+  'invited', 1, false,
+  now() - interval '120 seconds',
+  now() - interval '10 minutes',
+  0
+)
+ON CONFLICT (id) DO NOTHING;
+
+-- User 22: boss-queue entry (no raid yet), waiting 5 min
+INSERT INTO public.raid_queues (id, boss_id, user_id, status, position, is_vip, joined_at, invite_attempts)
+VALUES (
+  '00000000-0000-0000-0000-000000000622',
+  '00000000-0000-0000-0000-000000000305',
+  '00000000-0000-0000-0000-000000000022',
+  'queued', 1, false,
+  now() - interval '5 minutes',
+  0
+)
+ON CONFLICT (id) DO NOTHING;
+
+SET LOCAL ROLE authenticated;
+-- Call as host (user 11) so that the host's RLS read policy allows selecting
+-- both user 21's reverted row and user 22's promoted row in the assertions.
+-- expire_stale_invites is SECURITY DEFINER; the caller identity does not affect
+-- what the function reads or writes — only the post-call assertions care.
+SELECT set_config('request.jwt.claim.sub', '00000000-0000-0000-0000-000000000011', true);
+
+DO $$
+DECLARE
+  v_count    int;
+  v_reverted public.raid_queues%ROWTYPE;
+  v_promoted public.raid_queues%ROWTYPE;
+BEGIN
+  SELECT public.expire_stale_invites('00000000-0000-0000-0000-000000000415') INTO v_count;
+
+  IF v_count <= 0 THEN
+    RAISE EXCEPTION 'ESI-1: expected return > 0 (at least 1 expired), got %', v_count;
+  END IF;
+
+  -- User 21 must be reverted to queued
+  SELECT * INTO v_reverted FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000621';
+  IF v_reverted.status <> 'queued' THEN
+    RAISE EXCEPTION 'ESI-1: user 21 expected status=queued after expire, got %', v_reverted.status;
+  END IF;
+  IF v_reverted.invited_at IS NOT NULL THEN
+    RAISE EXCEPTION 'ESI-1: user 21 invited_at should be NULL after expire, got %', v_reverted.invited_at;
+  END IF;
+
+  -- User 22 must be promoted from boss queue into the raid
+  SELECT * INTO v_promoted FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000622';
+  IF v_promoted.status <> 'invited' THEN
+    RAISE EXCEPTION 'ESI-1: user 22 expected status=invited (boss-queue promote), got %', v_promoted.status;
+  END IF;
+  IF v_promoted.raid_id IS DISTINCT FROM '00000000-0000-0000-0000-000000000415'::uuid THEN
+    RAISE EXCEPTION 'ESI-1: user 22 expected raid_id=415, got %', v_promoted.raid_id;
+  END IF;
+  IF v_promoted.invited_at IS NULL THEN
+    RAISE EXCEPTION 'ESI-1: user 22 invited_at should not be NULL after boss-queue promote';
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$ BEGIN RAISE NOTICE 'ESI-1: boss-queue promote on expire — PASSED'; END; $$;
 
 ROLLBACK;
