@@ -31,7 +31,7 @@ port = 54324
 enabled = true
 site_url = "https://pogo-raid-premium.plbanos92.workers.dev"
 additional_redirect_urls = ["https://pogo-raid-premium.plbanos92.workers.dev"]
-jwt_expiry = 3600
+jwt_expiry = 86400
 enable_signup = true
 
 [auth.email]
