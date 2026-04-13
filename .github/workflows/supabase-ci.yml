@@ -29,6 +29,7 @@ jobs:
           test -f supabase/config.toml
           test -f supabase/seed.sql
           test -f supabase/tests/01_rpc_and_rls.sql
+          test -f supabase/tests/04_egg_lobby.sql
 
       - name: Start local Supabase stack
         run: supabase start
@@ -37,4 +38,6 @@ jobs:
         run: supabase db reset --local
 
       - name: Run SQL smoke tests
-        run: psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -f supabase/tests/01_rpc_and_rls.sql
+        run: |
+          psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -f supabase/tests/01_rpc_and_rls.sql
+          psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -f supabase/tests/04_egg_lobby.sql
