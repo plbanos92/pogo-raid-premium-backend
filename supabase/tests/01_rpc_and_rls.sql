@@ -1803,7 +1803,467 @@ DO $$ BEGIN RAISE NOTICE 'IA-1: expire to tail + auto-promote next — PASSED'; 
 
 ROLLBACK;
 
--- Test IA-1b: Solo user expires — should NOT be re-invited (no infinite cycle)
+-- ─────────────────────────────────────────────────────────────
+-- expired_joiner_fallback
+-- ─────────────────────────────────────────────────────────────
+BEGIN;
+
+INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
+VALUES ('00000000-0000-0000-0000-00000000f001', 'Fallback Boss', 5, 901)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raids (
+  id,
+  host_user_id,
+  raid_boss_id,
+  location_name,
+  start_time,
+  end_time,
+  capacity,
+  is_active,
+  status
+)
+VALUES (
+  '00000000-0000-0000-0000-00000000f100',
+  '00000000-0000-0000-0000-00000000f011',
+  '00000000-0000-0000-0000-00000000f001',
+  'Fallback Gym',
+  now() + interval '30 minutes',
+  now() + interval '90 minutes',
+  2,
+  true,
+  'open'
+)
+ON CONFLICT (id) DO NOTHING;
+
+-- 1. Sole expired entry, no fresh candidates: should be re-invited
+DELETE FROM public.raid_queues
+WHERE raid_id = '00000000-0000-0000-0000-00000000f100'
+   OR boss_id = '00000000-0000-0000-0000-00000000f001';
+UPDATE public.raids
+SET status = 'open', capacity = 2
+WHERE id = '00000000-0000-0000-0000-00000000f100';
+
+INSERT INTO public.raid_queues (
+  id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts
+)
+VALUES (
+  '00000000-0000-0000-0000-00000000f201',
+  '00000000-0000-0000-0000-00000000f100',
+  '00000000-0000-0000-0000-00000000f021',
+  'invited',
+  1,
+  false,
+  now() - interval '90 seconds',
+  now() - interval '5 minutes',
+  4
+);
+
+DO $$
+DECLARE
+  v_row public.raid_queues%ROWTYPE;
+BEGIN
+  PERFORM public.expire_stale_invites('00000000-0000-0000-0000-00000000f100');
+
+  SELECT * INTO v_row
+  FROM public.raid_queues
+  WHERE id = '00000000-0000-0000-0000-00000000f201';
+
+  IF v_row.status <> 'invited' THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: sole expired entry should be re-invited, got %', v_row.status;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 2. Repeated expire cycle: should be re-invited again
+UPDATE public.raid_queues
+SET invited_at = now() - interval '90 seconds'
+WHERE id = '00000000-0000-0000-0000-00000000f201';
+
+DO $$
+DECLARE
+  v_row public.raid_queues%ROWTYPE;
+BEGIN
+  PERFORM public.expire_stale_invites('00000000-0000-0000-0000-00000000f100');
+
+  SELECT * INTO v_row
+  FROM public.raid_queues
+  WHERE id = '00000000-0000-0000-0000-00000000f201';
+
+  IF v_row.status <> 'invited' THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: repeated expire should re-invite, got %', v_row.status;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 3. Multiple expired entries, one VIP: VIP should be re-invited
+DELETE FROM public.raid_queues
+WHERE raid_id = '00000000-0000-0000-0000-00000000f100'
+   OR boss_id = '00000000-0000-0000-0000-00000000f001';
+
+INSERT INTO public.raid_queues (
+  id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts
+)
+VALUES
+  (
+    '00000000-0000-0000-0000-00000000f201',
+    '00000000-0000-0000-0000-00000000f100',
+    '00000000-0000-0000-0000-00000000f021',
+    'invited',
+    1,
+    false,
+    now() - interval '90 seconds',
+    now() - interval '5 minutes',
+    1
+  ),
+  (
+    '00000000-0000-0000-0000-00000000f202',
+    '00000000-0000-0000-0000-00000000f100',
+    '00000000-0000-0000-0000-00000000f022',
+    'invited',
+    2,
+    true,
+    now() - interval '90 seconds',
+    now() - interval '4 minutes',
+    2
+  );
+
+DO $$
+DECLARE
+  v_invited_id uuid;
+  v_remaining_status text;
+BEGIN
+  PERFORM public.expire_stale_invites('00000000-0000-0000-0000-00000000f100');
+
+  SELECT id INTO v_invited_id
+  FROM public.raid_queues
+  WHERE raid_id = '00000000-0000-0000-0000-00000000f100'
+    AND status = 'invited';
+
+  SELECT status INTO v_remaining_status
+  FROM public.raid_queues
+  WHERE id = '00000000-0000-0000-0000-00000000f201';
+
+  IF v_invited_id <> '00000000-0000-0000-0000-00000000f202'::uuid THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: VIP should be re-invited, got %', v_invited_id;
+  END IF;
+
+  IF v_remaining_status <> 'queued' THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: non-VIP expired entry should remain queued, got %', v_remaining_status;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 4. Fresh queued candidate wins over expired
+DELETE FROM public.raid_queues
+WHERE raid_id = '00000000-0000-0000-0000-00000000f100'
+   OR boss_id = '00000000-0000-0000-0000-00000000f001';
+
+INSERT INTO public.raid_queues (
+  id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts
+)
+VALUES
+  (
+    '00000000-0000-0000-0000-00000000f201',
+    '00000000-0000-0000-0000-00000000f100',
+    '00000000-0000-0000-0000-00000000f021',
+    'invited',
+    1,
+    false,
+    now() - interval '90 seconds',
+    now() - interval '5 minutes',
+    1
+  ),
+  (
+    '00000000-0000-0000-0000-00000000f202',
+    '00000000-0000-0000-0000-00000000f100',
+    '00000000-0000-0000-0000-00000000f022',
+    'invited',
+    2,
+    true,
+    now() - interval '90 seconds',
+    now() - interval '4 minutes',
+    2
+  ),
+  (
+    '00000000-0000-0000-0000-00000000f203',
+    '00000000-0000-0000-0000-00000000f100',
+    '00000000-0000-0000-0000-00000000f023',
+    'queued',
+    3,
+    false,
+    NULL,
+    now() - interval '1 minute',
+    0
+  );
+
+DO $$
+DECLARE
+  v_invited_id uuid;
+BEGIN
+  PERFORM public.expire_stale_invites('00000000-0000-0000-0000-00000000f100');
+
+  SELECT id INTO v_invited_id
+  FROM public.raid_queues
+  WHERE raid_id = '00000000-0000-0000-0000-00000000f100'
+    AND status = 'invited';
+
+  IF v_invited_id <> '00000000-0000-0000-0000-00000000f203'::uuid THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: fresh queued should win, got %', v_invited_id;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 5. Boss-queue candidate wins over expired
+DELETE FROM public.raid_queues
+WHERE raid_id = '00000000-0000-0000-0000-00000000f100'
+   OR boss_id = '00000000-0000-0000-0000-00000000f001';
+
+INSERT INTO public.raid_queues (
+  id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts
+)
+VALUES (
+  '00000000-0000-0000-0000-00000000f201',
+  '00000000-0000-0000-0000-00000000f100',
+  '00000000-0000-0000-0000-00000000f021',
+  'invited',
+  1,
+  false,
+  now() - interval '90 seconds',
+  now() - interval '5 minutes',
+  1
+);
+
+INSERT INTO public.raid_queues (
+  id, raid_id, boss_id, user_id, status, is_vip, joined_at, invite_attempts
+)
+VALUES (
+  '00000000-0000-0000-0000-00000000f301',
+  NULL,
+  '00000000-0000-0000-0000-00000000f001',
+  '00000000-0000-0000-0000-00000000f024',
+  'queued',
+  false,
+  now() - interval '6 minutes',
+  0
+);
+
+DO $$
+DECLARE
+  v_boss public.raid_queues%ROWTYPE;
+  v_expired public.raid_queues%ROWTYPE;
+BEGIN
+  PERFORM public.expire_stale_invites('00000000-0000-0000-0000-00000000f100');
+
+  SELECT * INTO v_boss
+  FROM public.raid_queues
+  WHERE id = '00000000-0000-0000-0000-00000000f301';
+
+  SELECT * INTO v_expired
+  FROM public.raid_queues
+  WHERE id = '00000000-0000-0000-0000-00000000f201';
+
+  IF v_boss.status <> 'invited' OR v_boss.raid_id <> '00000000-0000-0000-0000-00000000f100'::uuid THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: boss-level queued candidate should be promoted, got status=% raid_id=%',
+      v_boss.status, v_boss.raid_id;
+  END IF;
+
+  IF v_expired.status <> 'queued' THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: expired raid-level entry should stay queued after Step B, got %', v_expired.status;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 6. Raid full skips fallback
+DELETE FROM public.raid_queues
+WHERE raid_id = '00000000-0000-0000-0000-00000000f100'
+   OR boss_id = '00000000-0000-0000-0000-00000000f001';
+UPDATE public.raids
+SET status = 'open', capacity = 1
+WHERE id = '00000000-0000-0000-0000-00000000f100';
+
+INSERT INTO public.raid_queues (
+  id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts
+)
+VALUES (
+  '00000000-0000-0000-0000-00000000f201',
+  '00000000-0000-0000-0000-00000000f100',
+  '00000000-0000-0000-0000-00000000f021',
+  'invited',
+  1,
+  false,
+  now() - interval '90 seconds',
+  now() - interval '5 minutes',
+  1
+);
+
+INSERT INTO public.raid_queues (
+  id, raid_id, user_id, status, position, is_vip, joined_at, invite_attempts
+)
+VALUES (
+  '00000000-0000-0000-0000-00000000f204',
+  '00000000-0000-0000-0000-00000000f100',
+  '00000000-0000-0000-0000-00000000f025',
+  'confirmed',
+  2,
+  false,
+  now() - interval '10 minutes',
+  0
+);
+
+DO $$
+DECLARE
+  v_row public.raid_queues%ROWTYPE;
+BEGIN
+  PERFORM public.expire_stale_invites('00000000-0000-0000-0000-00000000f100');
+
+  SELECT * INTO v_row
+  FROM public.raid_queues
+  WHERE id = '00000000-0000-0000-0000-00000000f201';
+
+  IF v_row.status <> 'queued' THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: raid full should leave expired entry queued, got %', v_row.status;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 7. Non-open/lobby raid skips fallback
+DELETE FROM public.raid_queues
+WHERE raid_id = '00000000-0000-0000-0000-00000000f100'
+   OR boss_id = '00000000-0000-0000-0000-00000000f001';
+DELETE FROM public.raids WHERE id = '00000000-0000-0000-0000-00000000f100';
+INSERT INTO public.raids (
+  id, host_user_id, raid_boss_id, location_name, start_time, end_time, capacity, is_active, status
+) VALUES (
+  '00000000-0000-0000-0000-00000000f100',
+  '00000000-0000-0000-0000-00000000f011',
+  '00000000-0000-0000-0000-00000000f001',
+  'Fallback Gym',
+  now() + interval '30 minutes',
+  now() + interval '90 minutes',
+  2,
+  false,
+  'cancelled'
+) ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raid_queues (
+  id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts
+)
+VALUES (
+  '00000000-0000-0000-0000-00000000f201',
+  '00000000-0000-0000-0000-00000000f100',
+  '00000000-0000-0000-0000-00000000f021',
+  'invited',
+  1,
+  false,
+  now() - interval '90 seconds',
+  now() - interval '5 minutes',
+  1
+);
+
+DO $$
+DECLARE
+  v_row public.raid_queues%ROWTYPE;
+BEGIN
+  PERFORM public.expire_stale_invites('00000000-0000-0000-0000-00000000f100');
+
+  SELECT * INTO v_row
+  FROM public.raid_queues
+  WHERE id = '00000000-0000-0000-0000-00000000f201';
+
+  IF v_row.status <> 'queued' THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: non-open/lobby should leave expired entry queued, got %', v_row.status;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 8. Regression: Step B promotion prevents Step C
+DELETE FROM public.raid_queues
+WHERE raid_id = '00000000-0000-0000-0000-00000000f100'
+   OR boss_id = '00000000-0000-0000-0000-00000000f001';
+DELETE FROM public.raids WHERE id = '00000000-0000-0000-0000-00000000f100';
+INSERT INTO public.raids (
+  id, host_user_id, raid_boss_id, location_name, start_time, end_time, capacity, is_active, status
+) VALUES (
+  '00000000-0000-0000-0000-00000000f100',
+  '00000000-0000-0000-0000-00000000f011',
+  '00000000-0000-0000-0000-00000000f001',
+  'Fallback Gym',
+  now() + interval '30 minutes',
+  now() + interval '90 minutes',
+  2,
+  true,
+  'open'
+) ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.raid_queues (
+  id, raid_id, user_id, status, position, is_vip, invited_at, joined_at, invite_attempts
+)
+VALUES (
+  '00000000-0000-0000-0000-00000000f201',
+  '00000000-0000-0000-0000-00000000f100',
+  '00000000-0000-0000-0000-00000000f021',
+  'invited',
+  1,
+  false,
+  now() - interval '90 seconds',
+  now() - interval '5 minutes',
+  1
+);
+
+INSERT INTO public.raid_queues (
+  id, raid_id, boss_id, user_id, status, is_vip, joined_at, invite_attempts
+)
+VALUES (
+  '00000000-0000-0000-0000-00000000f302',
+  NULL,
+  '00000000-0000-0000-0000-00000000f001',
+  '00000000-0000-0000-0000-00000000f026',
+  'queued',
+  false,
+  now() - interval '6 minutes',
+  0
+);
+
+DO $$
+DECLARE
+  v_boss public.raid_queues%ROWTYPE;
+  v_expired public.raid_queues%ROWTYPE;
+  v_invited_count int;
+BEGIN
+  PERFORM public.expire_stale_invites('00000000-0000-0000-0000-00000000f100');
+
+  SELECT * INTO v_boss
+  FROM public.raid_queues
+  WHERE id = '00000000-0000-0000-0000-00000000f302';
+
+  SELECT * INTO v_expired
+  FROM public.raid_queues
+  WHERE id = '00000000-0000-0000-0000-00000000f201';
+
+  SELECT COUNT(*) INTO v_invited_count
+  FROM public.raid_queues
+  WHERE raid_id = '00000000-0000-0000-0000-00000000f100'
+    AND status = 'invited';
+
+  IF v_boss.status <> 'invited' OR v_boss.raid_id <> '00000000-0000-0000-0000-00000000f100'::uuid THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: regression expected Step B candidate to be invited, got status=% raid_id=%',
+      v_boss.status, v_boss.raid_id;
+  END IF;
+
+  IF v_expired.status <> 'queued' THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: regression expected expired raid-level entry to stay queued, got %', v_expired.status;
+  END IF;
+
+  IF v_invited_count <> 1 THEN
+    RAISE EXCEPTION 'expired_joiner_fallback: regression expected exactly one invited row after Step B, got %', v_invited_count;
+  END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+ROLLBACK;
+
+-- Test IA-1b: Solo user expires — should be re-invited when no fresh candidates remain
 BEGIN;
 
 INSERT INTO public.raid_bosses (id, name, tier, pokemon_id)
@@ -1839,17 +2299,17 @@ BEGIN
   END IF;
 
   SELECT * INTO v_row FROM public.raid_queues WHERE id = '00000000-0000-0000-0000-000000000915';
-  -- Must stay queued — NOT re-invited (that would be an infinite cycle)
-  IF v_row.status <> 'queued' THEN
-    RAISE EXCEPTION 'IA-1b: solo user expected status=queued, got % (infinite cycle!)', v_row.status;
+  -- With sole-candidate fallback, the same user is re-invited.
+  IF v_row.status <> 'invited' THEN
+    RAISE EXCEPTION 'IA-1b: solo user expected status=invited, got %', v_row.status;
   END IF;
-  IF v_row.invited_at IS NOT NULL THEN
-    RAISE EXCEPTION 'IA-1b: solo user invited_at should be NULL after expire';
+  IF v_row.invited_at IS NULL THEN
+    RAISE EXCEPTION 'IA-1b: solo user invited_at should be reset after re-invite';
   END IF;
 END;
 $$ LANGUAGE plpgsql;
 
-DO $$ BEGIN RAISE NOTICE 'IA-1b: solo user expire — no infinite cycle — PASSED'; END; $$;
+DO $$ BEGIN RAISE NOTICE 'IA-1b: solo user expire — sole-candidate re-invite — PASSED'; END; $$;
 
 ROLLBACK;
 
