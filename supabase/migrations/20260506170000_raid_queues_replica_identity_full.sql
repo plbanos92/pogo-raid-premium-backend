@@ -1,0 +1,19 @@
+-- Fix: realtime postgres_changes UPDATEs on raid_queues were not delivered to
+-- joiners when a SECURITY DEFINER trigger (e.g. assign_boss_queue_on_raid_open
+-- / assign_boss_queue_on_raid_hatch / sole_candidate_reinvite) flipped only
+-- raid_id/status/invited_at on a boss-level row.
+--
+-- Without REPLICA IDENTITY FULL, the WAL UPDATE record contains only the PK
+-- and changed columns. user_id is NOT in the record (it didn't change), so
+-- Supabase realtime cannot evaluate either the channel filter
+-- (user_id=eq.<uid>) or the RLS SELECT policy (user_id = auth.uid()) against
+-- the OLD row, and the event is silently dropped to the affected joiner.
+--
+-- Symptom: joiner stays on "Waiting for a host" until the next refresh poll
+-- even though they're connected to realtime and the host already sees them
+-- as INVITED.
+--
+-- Fix: log full row images for raid_queues so realtime can resolve the filter
+-- and RLS check from the WAL record. WAL volume grows modestly; raid_queues
+-- rows are small (~150 bytes) and write rate is low.
+ALTER TABLE public.raid_queues REPLICA IDENTITY FULL;
